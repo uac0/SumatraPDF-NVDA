@@ -13726,6 +13726,19 @@ static LRESULT CALLBACK WndProcSumatraFrame(HWND hwnd, UINT msg, WPARAM wp, LPAR
             break;
 
         case WM_SETFOCUS:
+            if (win && win->textReaderEdit && win->textReaderEdit->hwnd && HwndIsVisible(win->textReaderEdit->hwnd)) {
+                int selStart = 0;
+                int selEnd = 0;
+                EditGetSelection(win->textReaderEdit, selStart, selEnd);
+                SetFocus(win->textReaderEdit->hwnd);
+                EditSelectText(win->textReaderEdit, selStart, selEnd);
+                return 0;
+            }
+            if (win) {
+                InvalidateCanvasKeyboardFocus(win);
+            }
+            break;
+
         case WM_KILLFOCUS:
             // document keyboard focus is on the frame; repaint canvas focus ring (#4644)
             if (win) {
@@ -13740,6 +13753,17 @@ static LRESULT CALLBACK WndProcSumatraFrame(HWND hwnd, UINT msg, WPARAM wp, LPAR
                 // restore home-page keyboard-selection tooltip if applicable
                 if (win) {
                     HomePageOnWindowActivate(win, true);
+                    if (win->textReaderEdit && win->textReaderEdit->hwnd && HwndIsVisible(win->textReaderEdit->hwnd)) {
+                        HWND focused = GetFocus();
+                        if (!focused || focused == hwnd || focused == win->hwndCanvas) {
+                            int selStart = 0;
+                            int selEnd = 0;
+                            EditGetSelection(win->textReaderEdit, selStart, selEnd);
+                            SetFocus(win->textReaderEdit->hwnd);
+                            EditSelectText(win->textReaderEdit, selStart, selEnd);
+                            return 0;
+                        }
+                    }
                 }
             } else if (win) {
                 // hide the topmost citation-hover popup when switching to
@@ -14716,6 +14740,26 @@ static bool MaybeTranslateAccelerator(MSG& msg) {
         bool isFrameOrCanvas = win && (msg.hwnd == win->hwndFrame || msg.hwnd == win->hwndCanvas);
         if (isFrameOrCanvas && NudgeSelectedAnnotation(win, msg.wParam)) {
             return true;
+        }
+    }
+
+    // In textReaderEdit (accessible NVDA text field), never let accelerators steal
+    // navigation, Shift+Arrow selection, Ctrl+A (Select All), or Ctrl+C / Ctrl+Insert (Copy).
+    if (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP) {
+        MainWindow* trWin = FindMainWindowByHwnd(msg.hwnd);
+        if (trWin && trWin->textReaderEdit && msg.hwnd == trWin->textReaderEdit->hwnd && !IsAltPressed()) {
+            WPARAM key = msg.wParam;
+            bool isNavOrSelKey = key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN ||
+                                 key == VK_HOME || key == VK_END;
+            if (isNavOrSelKey) {
+                return false;
+            }
+            if ((key == VK_PRIOR || key == VK_NEXT) && IsShiftPressed()) {
+                return false;
+            }
+            if (IsCtrlPressed() && !IsShiftPressed() && (key == 'C' || key == 'A' || key == VK_INSERT)) {
+                return false;
+            }
         }
     }
 
@@ -17358,6 +17402,222 @@ static bool LooksLikeListOrHeadingLine(Str line) {
     return false;
 }
 
+static bool IsCyrillicOrLatinLetterW(WCHAR c) {
+    return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || (c >= 0x0410 && c <= 0x044F) || c == 0x0401 ||
+           c == 0x0451;
+}
+
+static WCHAR ToLowerCyrLatW(WCHAR c) {
+    if (c >= L'A' && c <= L'Z') {
+        return c + (L'a' - L'A');
+    }
+    if (c >= 0x0410 && c <= 0x042F) {
+        return c + 0x20;
+    }
+    if (c == 0x0401) {
+        return 0x0451;
+    }
+    return c;
+}
+
+static bool IsUpperCyrLatW(WCHAR c) {
+    return (c >= L'A' && c <= L'Z') || (c >= 0x0410 && c <= 0x042F) || c == 0x0401;
+}
+
+static bool IsRussianVowelW(WCHAR c) {
+    WCHAR lc = ToLowerCyrLatW(c);
+    return lc == L'а' || lc == L'е' || lc == L'ё' || lc == L'и' || lc == L'о' || lc == L'у' || lc == L'ы' ||
+           lc == L'э' || lc == L'ю' || lc == L'я';
+}
+
+static bool IsAllowedRepeated3LetterRootW(const WCHAR* s) {
+    WCHAR b[4] = {ToLowerCyrLatW(s[0]), ToLowerCyrLatW(s[1]), ToLowerCyrLatW(s[2]), 0};
+    const WCHAR* allowed[] = {L"вар", L"тар", L"бер", L"пур", L"бон", L"кан", L"мур", L"там", L"бул",
+                              L"шар", L"гаг", L"тит", L"пап", L"мам", L"баб", L"дед", L"нян", L"дяд",
+                              L"тет", L"лул", L"лил", L"мим", L"кок", L"кук", L"как", L"зум"};
+    for (const WCHAR* w : allowed) {
+        if (b[0] == w[0] && b[1] == w[1] && b[2] == w[2]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void AppendWSliceAsUtf8(str::Builder& out, const WCHAR* w, int wLen) {
+    if (wLen <= 0) {
+        return;
+    }
+    TempStr u = ToUtf8Temp(WStr((WCHAR*)w, wLen));
+    out.Append(u);
+}
+
+// Cleans OCR duplicated leading syllables inside a word token (e.g. "маг-магнитного",
+// "ос-основу", "магмагнитного", "ососнову", "напрянапряженность", "учебучебника", "БаБарит")
+static void AppendCleanedWordW(str::Builder& out, const WCHAR* w, int wLen) {
+    if (wLen <= 0) {
+        return;
+    }
+    // 1. Check hyphenated duplication inside a word: "P-P<rest>" (e.g. "ос-основу", "маг-магнитного")
+    for (int pLen = 2; pLen <= 7 && pLen * 2 + 2 <= wLen; pLen++) {
+        if (w[pLen] == L'-') {
+            bool match = true;
+            for (int k = 0; k < pLen; k++) {
+                if (ToLowerCyrLatW(w[k]) != ToLowerCyrLatW(w[pLen + 1 + k])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match && (wLen - (pLen + 1)) >= pLen + 2) {
+                AppendWSliceAsUtf8(out, w + pLen + 1, wLen - (pLen + 1));
+                return;
+            }
+        }
+    }
+
+    // 2. Check mixed-case duplicated prefix: "БаБарит" -> "Барит"
+    for (int pLen = 2; pLen <= 6 && pLen * 2 + 2 <= wLen; pLen++) {
+        if (IsUpperCyrLatW(w[0]) && !IsUpperCyrLatW(w[1]) && IsUpperCyrLatW(w[pLen])) {
+            bool match = true;
+            for (int k = 0; k < pLen; k++) {
+                if (w[k] != w[pLen + k]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                AppendWSliceAsUtf8(out, w + pLen, wLen - pLen);
+                return;
+            }
+        }
+    }
+
+    // 3. Check 4..7 letter duplicated prefix at start of word: "учебучебника", "напрянапряженность"
+    for (int pLen = 7; pLen >= 4; pLen--) {
+        if (pLen * 2 + 2 <= wLen) {
+            bool match = true;
+            for (int k = 0; k < pLen; k++) {
+                if (ToLowerCyrLatW(w[k]) != ToLowerCyrLatW(w[pLen + k])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                AppendWSliceAsUtf8(out, w + pLen, wLen - pLen);
+                return;
+            }
+        }
+    }
+
+    // 4. Check 3-letter duplicated prefix: "магмагнитного", "подподготовке"
+    if (wLen >= 8) {
+        bool match3 = true;
+        for (int k = 0; k < 3; k++) {
+            if (ToLowerCyrLatW(w[k]) != ToLowerCyrLatW(w[3 + k])) {
+                match3 = false;
+                break;
+            }
+        }
+        if (match3 && !IsAllowedRepeated3LetterRootW(w)) {
+            AppendWSliceAsUtf8(out, w + 3, wLen - 3);
+            return;
+        }
+    }
+
+    // 5. Check 2-letter Vowel+Consonant duplicated prefix: "ососнову", "усусловие", "изизменение", "элэлектричество"
+    if (wLen >= 7 && IsRussianVowelW(w[0]) && !IsRussianVowelW(w[1])) {
+        if (ToLowerCyrLatW(w[0]) == ToLowerCyrLatW(w[2]) && ToLowerCyrLatW(w[1]) == ToLowerCyrLatW(w[3])) {
+            WCHAR c0 = ToLowerCyrLatW(w[0]);
+            WCHAR c1 = ToLowerCyrLatW(w[1]);
+            WCHAR c4 = ToLowerCyrLatW(w[4]);
+            bool isObobshch = (c0 == L'о' && c1 == L'б' && c4 == L'щ');
+            bool isArarat = (c0 == L'а' && c1 == L'р' && c4 == L'а');
+            if (!isObobshch && !isArarat) {
+                AppendWSliceAsUtf8(out, w + 2, wLen - 2);
+                return;
+            }
+        }
+    }
+
+    AppendWSliceAsUtf8(out, w, wLen);
+}
+
+static TempStr CleanOcrDuplicateSyllablesInLineTemp(Str lineUtf8) {
+    if (len(lineUtf8) == 0) {
+        return str::DupTemp(lineUtf8);
+    }
+    TempWStr ws = ToWStrTemp(lineUtf8);
+    int n = (int)len(ws);
+    if (n <= 3) {
+        return str::DupTemp(lineUtf8);
+    }
+    str::Builder sbOut;
+    int i = 0;
+    while (i < n) {
+        if (IsCyrillicOrLatinLetterW(ws.s[i])) {
+            int start = i;
+            while (i < n && (IsCyrillicOrLatinLetterW(ws.s[i]) ||
+                             (ws.s[i] == L'-' && i + 1 < n && IsCyrillicOrLatinLetterW(ws.s[i + 1])))) {
+                i++;
+            }
+            AppendCleanedWordW(sbOut, ws.s + start, i - start);
+        } else {
+            int start = i;
+            while (i < n && !IsCyrillicOrLatinLetterW(ws.s[i])) {
+                i++;
+            }
+            AppendWSliceAsUtf8(sbOut, ws.s + start, i - start);
+        }
+    }
+    return ToStrTemp(sbOut);
+}
+
+// When joining a line that ended with a hyphen ("маг-") and the next line ("магнитного"),
+// if the next line already starts with the hyphenated prefix ("маг"), remove the duplicate prefix from sb.
+static void JoinHyphenatedLineDeduplicatingPrefix(str::Builder& sb, Str nextLine) {
+    // Remove trailing '-' from sb first
+    sb.RemoveLast();
+    Str cur = ToStr(sb);
+    TempWStr wPrev = ToWStrTemp(cur);
+    TempWStr wNext = ToWStrTemp(nextLine);
+    int prevLen = (int)len(wPrev);
+    int nextLen = (int)len(wNext);
+
+    // Find start of last word fragment in wPrev
+    int fragStart = prevLen;
+    while (fragStart > 0 && IsCyrillicOrLatinLetterW(wPrev.s[fragStart - 1])) {
+        fragStart--;
+    }
+    int fragLen = prevLen - fragStart;
+
+    // Find length of first word in wNext
+    int nextWordLen = 0;
+    while (nextWordLen < nextLen && IsCyrillicOrLatinLetterW(wNext.s[nextWordLen])) {
+        nextWordLen++;
+    }
+
+    if (fragLen >= 1 && fragLen <= 10 && nextWordLen >= fragLen + 2) {
+        int matchedChars = 0;
+        for (int k = 0; k < fragLen; k++) {
+            if (ToLowerCyrLatW(wPrev.s[fragStart + k]) == ToLowerCyrLatW(wNext.s[k])) {
+                matchedChars++;
+            }
+        }
+        // Exact match for 1..3 chars; allow >=75% match (1 OCR typo) for 4..10 char hyphenated stubs
+        bool samePrefix = (fragLen <= 3) ? (matchedChars == fragLen) : (matchedChars * 4 >= fragLen * 3);
+        if (samePrefix) {
+            // Strip the duplicate UTF-8 bytes of the trailing fragment from sb
+            TempStr fragUtf8 = ToUtf8Temp(WStr(wPrev.s + fragStart, fragLen));
+            int bytesToRemove = (int)len(fragUtf8);
+            if (bytesToRemove > 0 && bytesToRemove <= len(sb)) {
+                for (int b = 0; b < bytesToRemove; b++) {
+                    sb.RemoveLast();
+                }
+            }
+        }
+    }
+    sb.Append(nextLine);
+}
+
 static void FormatPageTextForReader(Str rawText, bool rawLines, str::Builder& sb) {
     if (len(rawText) == 0) {
         sb.Append(StrL("[Пустая страница или изображение без текстового слоя]\r\n"));
@@ -17382,8 +17642,8 @@ static void FormatPageTextForReader(Str rawText, bool rawLines, str::Builder& sb
     }
 
     // Smart paragraph unwrapping for comfortable NVDA continuous reading:
-    // Joins lines broken mid-sentence and de-hyphenates words split across lines,
-    // while keeping paragraph breaks, headings, and list items intact.
+    // Joins lines broken mid-sentence, de-hyphenates words split across lines,
+    // and removes OCR-duplicated syllables at line wraps.
     Str rest = rawText;
     bool inParagraph = false;
     bool prevEndedWithHyphen = false;
@@ -17399,9 +17659,9 @@ static void FormatPageTextForReader(Str rawText, bool rawLines, str::Builder& sb
             line = Str(rest.s, nlIdx);
             rest = Str(rest.s + nlIdx + 1, len(rest) - nlIdx - 1);
         }
-        TempStr trimmed = str::DupTemp(line);
-        str::TrimWSInPlace(trimmed, str::TrimOpt::Both);
-        if (len(trimmed) == 0) {
+        TempStr rawTrimmed = str::DupTemp(line);
+        str::TrimWSInPlace(rawTrimmed, str::TrimOpt::Both);
+        if (len(rawTrimmed) == 0) {
             if (inParagraph) {
                 sb.Append(StrL("\r\n\r\n"));
                 inParagraph = false;
@@ -17411,6 +17671,22 @@ static void FormatPageTextForReader(Str rawText, bool rawLines, str::Builder& sb
             continue;
         }
 
+        // Normalize trailing Unicode soft hyphen (U+00AD: C2 AD) or Unicode hyphen (U+2010: E2 80 90) to ASCII '-'
+        if (len(rawTrimmed) >= 2 && (u8)rawTrimmed.s[len(rawTrimmed) - 2] == 0xC2 &&
+            (u8)rawTrimmed.s[len(rawTrimmed) - 1] == 0xAD) {
+            rawTrimmed.s[len(rawTrimmed) - 2] = '-';
+            rawTrimmed.s[len(rawTrimmed) - 1] = 0;
+            rawTrimmed.len -= 1;
+        } else if (len(rawTrimmed) >= 3 && (u8)rawTrimmed.s[len(rawTrimmed) - 3] == 0xE2 &&
+                   (u8)rawTrimmed.s[len(rawTrimmed) - 2] == 0x80 &&
+                   ((u8)rawTrimmed.s[len(rawTrimmed) - 1] == 0x90 || (u8)rawTrimmed.s[len(rawTrimmed) - 1] == 0x91)) {
+            rawTrimmed.s[len(rawTrimmed) - 3] = '-';
+            rawTrimmed.s[len(rawTrimmed) - 2] = 0;
+            rawTrimmed.len -= 2;
+        }
+
+        TempStr trimmed = CleanOcrDuplicateSyllablesInLineTemp(rawTrimmed);
+
         if (!inParagraph) {
             sb.Append(trimmed);
             inParagraph = true;
@@ -17418,9 +17694,7 @@ static void FormatPageTextForReader(Str rawText, bool rawLines, str::Builder& sb
             sb.Append(StrL("\r\n"));
             sb.Append(trimmed);
         } else if (prevEndedWithHyphen && len(sb) >= 2) {
-            // Remove trailing hyphen if followed by a continuation word
-            sb.RemoveLast();
-            sb.Append(trimmed);
+            JoinHyphenatedLineDeduplicatingPrefix(sb, trimmed);
         } else if (IsSentenceTerminalChar(prevLastChar) && len(trimmed) < 65) {
             // Short line ending in sentence terminal was likely a heading or short paragraph
             sb.Append(StrL("\r\n"));
@@ -17430,7 +17704,7 @@ static void FormatPageTextForReader(Str rawText, bool rawLines, str::Builder& sb
             sb.Append(trimmed);
         }
 
-        char lastC = trimmed.s[len(trimmed) - 1];
+        char lastC = len(trimmed) > 0 ? trimmed.s[len(trimmed) - 1] : 0;
         prevLastChar = lastC;
         prevEndedWithHyphen = (lastC == '-' && len(trimmed) >= 2 && trimmed.s[len(trimmed) - 2] != ' ');
     }
@@ -17447,7 +17721,164 @@ static int GetWideCharCountUTF8(Str s) {
     return n > 0 ? n : 0;
 }
 
-static void SyncPageFromTextCaret(MainWindow* win) {
+// --- Persistent local reading positions (exact page + character offset within page) ---
+struct SavedReaderPos {
+    char* filePath = nullptr;
+    int pageNo = 1;
+    int charOffsetInPage = 0;
+};
+
+static Vec<SavedReaderPos> gSavedReaderPositions;
+static bool gSavedReaderPositionsLoaded = false;
+
+static void EnsureReaderPositionsLoaded() {
+    if (gSavedReaderPositionsLoaded) {
+        return;
+    }
+    gSavedReaderPositionsLoaded = true;
+    WCHAR pathW[MAX_PATH]{};
+    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\SumatraPDF\\sumatra-nvda-positions.dat", pathW, MAX_PATH);
+    HANDLE hFile = CreateFileW(pathW, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE || fileSize > 16 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return;
+    }
+    char* buf = (char*)malloc(fileSize + 1);
+    if (!buf) {
+        CloseHandle(hFile);
+        return;
+    }
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, buf, fileSize, &bytesRead, nullptr);
+    CloseHandle(hFile);
+    if (!ok || bytesRead == 0) {
+        free(buf);
+        return;
+    }
+    buf[bytesRead] = 0;
+    Str rest(buf, (int)bytesRead);
+    while (len(rest) > 0) {
+        int nl = str::IndexOfChar(rest, '\n');
+        Str line;
+        if (nl < 0) {
+            line = rest;
+            rest = {};
+        } else {
+            line = Str(rest.s, nl);
+            rest = Str(rest.s + nl + 1, len(rest) - nl - 1);
+        }
+        TempStr t = str::DupTemp(line);
+        str::TrimWSInPlace(t, str::TrimOpt::Both);
+        if (len(t) == 0) {
+            continue;
+        }
+        int tab1 = str::IndexOfChar(t, '\t');
+        if (tab1 <= 0) {
+            continue;
+        }
+        int tab2 = str::IndexOfChar(Str(t.s + tab1 + 1, len(t) - tab1 - 1), '\t');
+        if (tab2 <= 0) {
+            continue;
+        }
+        tab2 += tab1 + 1;
+        int pageNo = atoi(t.s);
+        int charOff = atoi(t.s + tab1 + 1);
+        Str fp(t.s + tab2 + 1, len(t) - tab2 - 1);
+        if (pageNo >= 1 && len(fp) > 0) {
+            SavedReaderPos entry;
+            entry.filePath = str::Dup(fp).s;
+            entry.pageNo = pageNo;
+            entry.charOffsetInPage = charOff >= 0 ? charOff : 0;
+            VecAppend(gSavedReaderPositions, entry);
+        }
+    }
+    free(buf);
+}
+
+static void FlushReaderPositionsToDisk() {
+    EnsureReaderPositionsLoaded();
+    str::Builder sb;
+    for (const SavedReaderPos& e : gSavedReaderPositions) {
+        if (e.filePath && e.pageNo >= 1) {
+            sb.Append(fmt("%d\t%d\t%s\n", e.pageNo, e.charOffsetInPage, Str(e.filePath)));
+        }
+    }
+    WCHAR dirW[MAX_PATH]{};
+    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\SumatraPDF", dirW, MAX_PATH);
+    CreateDirectoryW(dirW, nullptr);
+    WCHAR pathW[MAX_PATH]{};
+    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\SumatraPDF\\sumatra-nvda-positions.dat", pathW, MAX_PATH);
+    HANDLE hFile = CreateFileW(pathW, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        Str content = ToStr(sb);
+        DWORD written = 0;
+        if (len(content) > 0) {
+            WriteFile(hFile, content.s, (DWORD)len(content), &written, nullptr);
+        }
+        CloseHandle(hFile);
+    }
+}
+
+static bool LoadReaderPositionForFile(Str filePath, int* outPageNo, int* outCharOffset) {
+    if (len(filePath) == 0) {
+        return false;
+    }
+    EnsureReaderPositionsLoaded();
+    for (const SavedReaderPos& e : gSavedReaderPositions) {
+        if (e.filePath && (str::EqI(Str(e.filePath), filePath) || path::IsSame(Str(e.filePath), filePath))) {
+            if (outPageNo) {
+                *outPageNo = e.pageNo;
+            }
+            if (outCharOffset) {
+                *outCharOffset = e.charOffsetInPage;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void SaveReaderPositionForFile(Str filePath, int pageNo, int charOffsetInPage, bool flushToDisk) {
+    if (len(filePath) == 0 || pageNo < 1) {
+        return;
+    }
+    if (charOffsetInPage < 0) {
+        charOffsetInPage = 0;
+    }
+    EnsureReaderPositionsLoaded();
+    bool found = false;
+    for (SavedReaderPos& e : gSavedReaderPositions) {
+        if (e.filePath && (str::EqI(Str(e.filePath), filePath) || path::IsSame(Str(e.filePath), filePath))) {
+            e.pageNo = pageNo;
+            e.charOffsetInPage = charOffsetInPage;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        SavedReaderPos entry;
+        entry.filePath = str::Dup(filePath).s;
+        entry.pageNo = pageNo;
+        entry.charOffsetInPage = charOffsetInPage;
+        VecAppend(gSavedReaderPositions, entry);
+    }
+    FileState* fs = FileHistoryFindByPath(filePath);
+    if (fs) {
+        str::ReplaceWithCopy(&fs->pageNo, fmt("%d", pageNo));
+        fs->useDefaultState = false;
+    }
+    if (flushToDisk) {
+        FlushReaderPositionsToDisk();
+    }
+}
+
+static void SyncPageFromTextCaret(MainWindow* win, bool flushToDisk = false) {
     if (!win || !win->textReaderEdit || !win->textReaderEdit->hwnd || !win->IsDocLoaded() || !win->ctrl) {
         return;
     }
@@ -17459,12 +17890,21 @@ static void SyncPageFromTextCaret(MainWindow* win) {
     int selEnd = 0;
     EditGetSelection(win->textReaderEdit, selStart, selEnd);
     int pageNo = win->textReaderPageNos[0];
+    int pageStartOffset = win->textReaderPageOffsets[0];
     for (int i = 0; i < nOffsets; i++) {
         if (selStart >= win->textReaderPageOffsets[i]) {
             pageNo = win->textReaderPageNos[i];
+            pageStartOffset = win->textReaderPageOffsets[i];
         } else {
             break;
         }
+    }
+    int charOffsetInPage = selStart >= pageStartOffset ? (selStart - pageStartOffset) : 0;
+    SaveReaderPositionForFile(win->ctrl->GetFilePath(), pageNo, charOffsetInPage, true);
+
+    // Do not change page or touch caret while user has an active selection or holds Shift
+    if (selStart != selEnd || IsShiftPressed()) {
+        return;
     }
     if (pageNo != win->currPageNo && win->ctrl->ValidPageNo(pageNo)) {
         win->textReaderSyncing = true;
@@ -17553,6 +17993,7 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
         sb.Append(StrL("Горячие клавиши управления:\r\n"));
         sb.Append(StrL("• Ctrl+O — Открыть файл (PDF, DjVu, EPUB, FB2, MOBI, TXT, CHM и др.)\r\n"));
         sb.Append(StrL("• Стрелки Вверх / Вниз, Ctrl+Вверх / Вниз — Чтение по строкам и абзацам\r\n"));
+        sb.Append(StrL("• Shift+Стрелки, Ctrl+A, Ctrl+C — Выделение и копирование текста в буфер обмена\r\n"));
         sb.Append(StrL("• PageDown / PageUp — Листание текста (или страниц в постраничном режиме)\r\n"));
         sb.Append(StrL("• Ctrl+PageDown / Ctrl+PageUp — Переход ровно к следующей / предыдущей странице\r\n"));
         sb.Append(StrL("• Ctrl+G — Перейти к странице по номеру\r\n"));
@@ -17574,7 +18015,12 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
                 count++;
                 win->textReaderRecentPaths.Append(fs->filePath);
                 TempStr baseName = path::GetBaseNameTemp(fs->filePath);
+                int savedP = 0;
+                int savedOff = 0;
                 Str pageStr = len(fs->pageNo) > 0 ? fs->pageNo : StrL("1");
+                if (LoadReaderPositionForFile(fs->filePath, &savedP, &savedOff) && savedP >= 1) {
+                    pageStr = fmt("%d", savedP);
+                }
                 sb.Append(fmt("%d. %s (Стр. %s) — [%s]\r\n", count, baseName, pageStr, fs->filePath));
                 if (count >= 20) {
                     break;
@@ -17585,6 +18031,7 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
             sb.Append(StrL("Список недавних книг пуст. Нажмите Ctrl+O, чтобы открыть книгу.\r\n"));
         }
 
+        SendMessageW(win->textReaderEdit->hwnd, EM_SETLIMITTEXT, 0, 0);
         win->textReaderEdit->SetText(ToStr(sb));
         EditSelectText(win->textReaderEdit, 0, 0);
         SendMessageW(win->textReaderEdit->hwnd, EM_SCROLLCARET, 0, 0);
@@ -17607,7 +18054,20 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
     if (nPages <= 0) {
         return;
     }
+
+    int savedPage = 0;
+    int savedCharOffset = 0;
+    bool hasSavedPos = LoadReaderPositionForFile(win->ctrl->GetFilePath(), &savedPage, &savedCharOffset);
+
     int currPage = win->ctrl->CurrentPageNo();
+    if (forceReload && hasSavedPos && savedPage >= 1 && savedPage <= nPages) {
+        currPage = savedPage;
+        if (win->ctrl->CurrentPageNo() != currPage) {
+            win->textReaderSyncing = true;
+            win->ctrl->GoToPage(currPage, false);
+            win->textReaderSyncing = false;
+        }
+    }
     if (currPage < 1 || currPage > nPages) {
         currPage = 1;
     }
@@ -17617,10 +18077,6 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
     if (win->textReaderSinglePage) {
         startPage = currPage;
         endPage = currPage;
-    } else if (nPages > 250) {
-        // Window of 100 pages for instant loading on very large books
-        startPage = ((currPage - 1) / 100) * 100 + 1;
-        endPage = std::min(nPages, startPage + 99);
     }
 
     if (!forceReload && startPage == win->textReaderStartPage && endPage == win->textReaderEndPage &&
@@ -17647,7 +18103,7 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
         sb.Append(fmt("=== Книга: %s | Всего страниц: %d ===\r\n", fileName, nPages));
     }
     sb.Append(fmt("[Режим: %s | Строки: %s | F12: Оглавление | Ctrl+G: Переход к стр. | Ctrl+F: Поиск | F8/F9: Режимы]\r\n\r\n",
-                  win->textReaderSinglePage ? StrL("Постраничный (F9)") : StrL("Непрерывный текст (F9)"),
+                  win->textReaderSinglePage ? StrL("Постраничный (F9)") : StrL("Вся книга целиком (F9)"),
                   win->textReaderRawLines ? StrL("Оригинальные строки (F8)") : StrL("Умные абзацы (F8)")));
 
     int wCharOffset = GetWideCharCountUTF8(ToStr(sb));
@@ -17686,8 +18142,30 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
     }
 
     win->textReaderEdit->SuspendRedraw();
+    SendMessageW(win->textReaderEdit->hwnd, EM_SETLIMITTEXT, 0, 0);
     win->textReaderEdit->SetText(ToStr(sb));
-    SyncTextReaderToPage(win, currPage, false);
+
+    // Restore exact reading position (page + character offset within page) if available
+    int targetCaretPos = -1;
+    int nOffsets = len(win->textReaderPageOffsets);
+    for (int i = 0; i < nOffsets; i++) {
+        if (win->textReaderPageNos[i] == currPage) {
+            int pageStart = win->textReaderPageOffsets[i];
+            int pageEnd = (i + 1 < nOffsets) ? win->textReaderPageOffsets[i + 1] : wCharOffset;
+            targetCaretPos = pageStart;
+            if (hasSavedPos && savedPage == currPage && savedCharOffset > 0) {
+                targetCaretPos = std::min(pageStart + savedCharOffset, std::max(pageStart, pageEnd - 1));
+            }
+            break;
+        }
+    }
+    if (targetCaretPos >= 0) {
+        EditSelectText(win->textReaderEdit, targetCaretPos, targetCaretPos);
+        SendMessageW(win->textReaderEdit->hwnd, EM_SCROLLCARET, 0, 0);
+    } else {
+        SyncTextReaderToPage(win, currPage, false);
+    }
+
     win->textReaderEdit->ResumeRedraw();
     HwndInvalidate(win->textReaderEdit->hwnd);
 
@@ -17743,6 +18221,23 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
     if (msg == WM_KEYDOWN) {
         bool isCtrl = IsCtrlPressed();
         bool isShift = IsShiftPressed();
+        bool isAlt = IsAltPressed();
+
+        // Explicit support for Ctrl+A (Select All) and Ctrl+C / Ctrl+Insert (Copy)
+        if (isCtrl && !isShift && !isAlt) {
+            if (wp == 'A') {
+                SendMessageW(ev->hwnd, EM_SETSEL, 0, -1);
+                ev->didHandle = true;
+                ev->result = 0;
+                return;
+            }
+            if (wp == 'C' || wp == VK_INSERT) {
+                SendMessageW(ev->hwnd, WM_COPY, 0, 0);
+                ev->didHandle = true;
+                ev->result = 0;
+                return;
+            }
+        }
 
         if (!win->IsDocLoaded()) {
             if (wp == VK_RETURN) {
@@ -17764,6 +18259,7 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
             }
         } else {
             if (wp == VK_F8) {
+                SyncPageFromTextCaret(win, true);
                 win->textReaderRawLines = !win->textReaderRawLines;
                 UpdateTextReader(win, true, true);
                 ev->didHandle = true;
@@ -17771,21 +18267,24 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
                 return;
             }
             if (wp == VK_F9) {
+                SyncPageFromTextCaret(win, true);
                 win->textReaderSinglePage = !win->textReaderSinglePage;
                 UpdateTextReader(win, true, true);
                 ev->didHandle = true;
                 ev->result = 0;
                 return;
             }
-            if ((wp == VK_NEXT || wp == VK_PRIOR) && (win->textReaderSinglePage || isCtrl)) {
+            if ((wp == VK_NEXT || wp == VK_PRIOR) && !isShift && (win->textReaderSinglePage || isCtrl)) {
                 if (win->ctrl) {
                     if (wp == VK_NEXT) {
                         win->ctrl->GoToNextPage();
                     } else {
                         win->ctrl->GoToPrevPage();
                     }
+                    int newPage = win->ctrl->CurrentPageNo();
+                    SaveReaderPositionForFile(win->ctrl->GetFilePath(), newPage, 0, true);
                     UpdateTextReader(win, true, win->textReaderSinglePage);
-                    SyncTextReaderToPage(win, win->ctrl->CurrentPageNo(), true);
+                    SyncTextReaderToPage(win, newPage, true);
                 }
                 ev->didHandle = true;
                 ev->result = 0;
@@ -17796,8 +18295,12 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
         ev->result = ev->w->WndProcDefault(ev->hwnd, ev->msg, ev->wparam, ev->lparam);
         ev->didHandle = true;
         if (win->IsDocLoaded() && !win->textReaderSinglePage) {
-            SyncPageFromTextCaret(win);
+            SyncPageFromTextCaret(win, true);
         }
         return;
+    } else if (msg == WM_KILLFOCUS || msg == WM_DESTROY) {
+        if (win->IsDocLoaded()) {
+            SyncPageFromTextCaret(win, true);
+        }
     }
 }
