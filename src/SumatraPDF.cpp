@@ -11847,6 +11847,11 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
         case CmdFavoriteToggle:
             ToggleFavorites(win);
+            if (win->favTreeView && win->favTreeView->hwnd && HwndIsVisible(win->favTreeView->hwnd)) {
+                HwndSetFocus(win->favTreeView->hwnd);
+            } else {
+                win->Focus();
+            }
             break;
         case CmdFavoriteShowInTab:
             ToggleFavoritesTab(win);
@@ -17721,164 +17726,7 @@ static int GetWideCharCountUTF8(Str s) {
     return n > 0 ? n : 0;
 }
 
-// --- Persistent local reading positions (exact page + character offset within page) ---
-struct SavedReaderPos {
-    char* filePath = nullptr;
-    int pageNo = 1;
-    int charOffsetInPage = 0;
-};
-
-static Vec<SavedReaderPos> gSavedReaderPositions;
-static bool gSavedReaderPositionsLoaded = false;
-
-static void EnsureReaderPositionsLoaded() {
-    if (gSavedReaderPositionsLoaded) {
-        return;
-    }
-    gSavedReaderPositionsLoaded = true;
-    WCHAR pathW[MAX_PATH]{};
-    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\SumatraPDF\\sumatra-nvda-positions.dat", pathW, MAX_PATH);
-    HANDLE hFile = CreateFileW(pathW, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    DWORD fileSize = GetFileSize(hFile, nullptr);
-    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE || fileSize > 16 * 1024 * 1024) {
-        CloseHandle(hFile);
-        return;
-    }
-    char* buf = (char*)malloc(fileSize + 1);
-    if (!buf) {
-        CloseHandle(hFile);
-        return;
-    }
-    DWORD bytesRead = 0;
-    BOOL ok = ReadFile(hFile, buf, fileSize, &bytesRead, nullptr);
-    CloseHandle(hFile);
-    if (!ok || bytesRead == 0) {
-        free(buf);
-        return;
-    }
-    buf[bytesRead] = 0;
-    Str rest(buf, (int)bytesRead);
-    while (len(rest) > 0) {
-        int nl = str::IndexOfChar(rest, '\n');
-        Str line;
-        if (nl < 0) {
-            line = rest;
-            rest = {};
-        } else {
-            line = Str(rest.s, nl);
-            rest = Str(rest.s + nl + 1, len(rest) - nl - 1);
-        }
-        TempStr t = str::DupTemp(line);
-        str::TrimWSInPlace(t, str::TrimOpt::Both);
-        if (len(t) == 0) {
-            continue;
-        }
-        int tab1 = str::IndexOfChar(t, '\t');
-        if (tab1 <= 0) {
-            continue;
-        }
-        int tab2 = str::IndexOfChar(Str(t.s + tab1 + 1, len(t) - tab1 - 1), '\t');
-        if (tab2 <= 0) {
-            continue;
-        }
-        tab2 += tab1 + 1;
-        int pageNo = atoi(t.s);
-        int charOff = atoi(t.s + tab1 + 1);
-        Str fp(t.s + tab2 + 1, len(t) - tab2 - 1);
-        if (pageNo >= 1 && len(fp) > 0) {
-            SavedReaderPos entry;
-            entry.filePath = str::Dup(fp).s;
-            entry.pageNo = pageNo;
-            entry.charOffsetInPage = charOff >= 0 ? charOff : 0;
-            VecAppend(gSavedReaderPositions, entry);
-        }
-    }
-    free(buf);
-}
-
-static void FlushReaderPositionsToDisk() {
-    EnsureReaderPositionsLoaded();
-    str::Builder sb;
-    for (const SavedReaderPos& e : gSavedReaderPositions) {
-        if (e.filePath && e.pageNo >= 1) {
-            sb.Append(fmt("%d\t%d\t%s\n", e.pageNo, e.charOffsetInPage, Str(e.filePath)));
-        }
-    }
-    WCHAR dirW[MAX_PATH]{};
-    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\SumatraPDF", dirW, MAX_PATH);
-    CreateDirectoryW(dirW, nullptr);
-    WCHAR pathW[MAX_PATH]{};
-    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\SumatraPDF\\sumatra-nvda-positions.dat", pathW, MAX_PATH);
-    HANDLE hFile = CreateFileW(pathW, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                               nullptr);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        Str content = ToStr(sb);
-        DWORD written = 0;
-        if (len(content) > 0) {
-            WriteFile(hFile, content.s, (DWORD)len(content), &written, nullptr);
-        }
-        CloseHandle(hFile);
-    }
-}
-
-static bool LoadReaderPositionForFile(Str filePath, int* outPageNo, int* outCharOffset) {
-    if (len(filePath) == 0) {
-        return false;
-    }
-    EnsureReaderPositionsLoaded();
-    for (const SavedReaderPos& e : gSavedReaderPositions) {
-        if (e.filePath && (str::EqI(Str(e.filePath), filePath) || path::IsSame(Str(e.filePath), filePath))) {
-            if (outPageNo) {
-                *outPageNo = e.pageNo;
-            }
-            if (outCharOffset) {
-                *outCharOffset = e.charOffsetInPage;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-static void SaveReaderPositionForFile(Str filePath, int pageNo, int charOffsetInPage, bool flushToDisk) {
-    if (len(filePath) == 0 || pageNo < 1) {
-        return;
-    }
-    if (charOffsetInPage < 0) {
-        charOffsetInPage = 0;
-    }
-    EnsureReaderPositionsLoaded();
-    bool found = false;
-    for (SavedReaderPos& e : gSavedReaderPositions) {
-        if (e.filePath && (str::EqI(Str(e.filePath), filePath) || path::IsSame(Str(e.filePath), filePath))) {
-            e.pageNo = pageNo;
-            e.charOffsetInPage = charOffsetInPage;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        SavedReaderPos entry;
-        entry.filePath = str::Dup(filePath).s;
-        entry.pageNo = pageNo;
-        entry.charOffsetInPage = charOffsetInPage;
-        VecAppend(gSavedReaderPositions, entry);
-    }
-    FileState* fs = FileHistoryFindByPath(filePath);
-    if (fs) {
-        str::ReplaceWithCopy(&fs->pageNo, fmt("%d", pageNo));
-        fs->useDefaultState = false;
-    }
-    if (flushToDisk) {
-        FlushReaderPositionsToDisk();
-    }
-}
-
-static void SyncPageFromTextCaret(MainWindow* win, bool flushToDisk = false) {
+static void SyncPageFromTextCaret(MainWindow* win) {
     if (!win || !win->textReaderEdit || !win->textReaderEdit->hwnd || !win->IsDocLoaded() || !win->ctrl) {
         return;
     }
@@ -17889,22 +17737,17 @@ static void SyncPageFromTextCaret(MainWindow* win, bool flushToDisk = false) {
     int selStart = 0;
     int selEnd = 0;
     EditGetSelection(win->textReaderEdit, selStart, selEnd);
-    int pageNo = win->textReaderPageNos[0];
-    int pageStartOffset = win->textReaderPageOffsets[0];
-    for (int i = 0; i < nOffsets; i++) {
-        if (selStart >= win->textReaderPageOffsets[i]) {
-            pageNo = win->textReaderPageNos[i];
-            pageStartOffset = win->textReaderPageOffsets[i];
-        } else {
-            break;
-        }
-    }
-    int charOffsetInPage = selStart >= pageStartOffset ? (selStart - pageStartOffset) : 0;
-    SaveReaderPositionForFile(win->ctrl->GetFilePath(), pageNo, charOffsetInPage, true);
-
     // Do not change page or touch caret while user has an active selection or holds Shift
     if (selStart != selEnd || IsShiftPressed()) {
         return;
+    }
+    int pageNo = win->textReaderPageNos[0];
+    for (int i = 0; i < nOffsets; i++) {
+        if (selStart >= win->textReaderPageOffsets[i]) {
+            pageNo = win->textReaderPageNos[i];
+        } else {
+            break;
+        }
     }
     if (pageNo != win->currPageNo && win->ctrl->ValidPageNo(pageNo)) {
         win->textReaderSyncing = true;
@@ -18015,12 +17858,7 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
                 count++;
                 win->textReaderRecentPaths.Append(fs->filePath);
                 TempStr baseName = path::GetBaseNameTemp(fs->filePath);
-                int savedP = 0;
-                int savedOff = 0;
                 Str pageStr = len(fs->pageNo) > 0 ? fs->pageNo : StrL("1");
-                if (LoadReaderPositionForFile(fs->filePath, &savedP, &savedOff) && savedP >= 1) {
-                    pageStr = fmt("%d", savedP);
-                }
                 sb.Append(fmt("%d. %s (Стр. %s) — [%s]\r\n", count, baseName, pageStr, fs->filePath));
                 if (count >= 20) {
                     break;
@@ -18054,20 +17892,7 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
     if (nPages <= 0) {
         return;
     }
-
-    int savedPage = 0;
-    int savedCharOffset = 0;
-    bool hasSavedPos = LoadReaderPositionForFile(win->ctrl->GetFilePath(), &savedPage, &savedCharOffset);
-
     int currPage = win->ctrl->CurrentPageNo();
-    if (forceReload && hasSavedPos && savedPage >= 1 && savedPage <= nPages) {
-        currPage = savedPage;
-        if (win->ctrl->CurrentPageNo() != currPage) {
-            win->textReaderSyncing = true;
-            win->ctrl->GoToPage(currPage, false);
-            win->textReaderSyncing = false;
-        }
-    }
     if (currPage < 1 || currPage > nPages) {
         currPage = 1;
     }
@@ -18144,28 +17969,7 @@ void UpdateTextReader(MainWindow* win, bool focusText, bool forceReload) {
     win->textReaderEdit->SuspendRedraw();
     SendMessageW(win->textReaderEdit->hwnd, EM_SETLIMITTEXT, 0, 0);
     win->textReaderEdit->SetText(ToStr(sb));
-
-    // Restore exact reading position (page + character offset within page) if available
-    int targetCaretPos = -1;
-    int nOffsets = len(win->textReaderPageOffsets);
-    for (int i = 0; i < nOffsets; i++) {
-        if (win->textReaderPageNos[i] == currPage) {
-            int pageStart = win->textReaderPageOffsets[i];
-            int pageEnd = (i + 1 < nOffsets) ? win->textReaderPageOffsets[i + 1] : wCharOffset;
-            targetCaretPos = pageStart;
-            if (hasSavedPos && savedPage == currPage && savedCharOffset > 0) {
-                targetCaretPos = std::min(pageStart + savedCharOffset, std::max(pageStart, pageEnd - 1));
-            }
-            break;
-        }
-    }
-    if (targetCaretPos >= 0) {
-        EditSelectText(win->textReaderEdit, targetCaretPos, targetCaretPos);
-        SendMessageW(win->textReaderEdit->hwnd, EM_SCROLLCARET, 0, 0);
-    } else {
-        SyncTextReaderToPage(win, currPage, false);
-    }
-
+    SyncTextReaderToPage(win, currPage, false);
     win->textReaderEdit->ResumeRedraw();
     HwndInvalidate(win->textReaderEdit->hwnd);
 
@@ -18259,7 +18063,6 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
             }
         } else {
             if (wp == VK_F8) {
-                SyncPageFromTextCaret(win, true);
                 win->textReaderRawLines = !win->textReaderRawLines;
                 UpdateTextReader(win, true, true);
                 ev->didHandle = true;
@@ -18267,7 +18070,6 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
                 return;
             }
             if (wp == VK_F9) {
-                SyncPageFromTextCaret(win, true);
                 win->textReaderSinglePage = !win->textReaderSinglePage;
                 UpdateTextReader(win, true, true);
                 ev->didHandle = true;
@@ -18281,10 +18083,8 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
                     } else {
                         win->ctrl->GoToPrevPage();
                     }
-                    int newPage = win->ctrl->CurrentPageNo();
-                    SaveReaderPositionForFile(win->ctrl->GetFilePath(), newPage, 0, true);
                     UpdateTextReader(win, true, win->textReaderSinglePage);
-                    SyncTextReaderToPage(win, newPage, true);
+                    SyncTextReaderToPage(win, win->ctrl->CurrentPageNo(), true);
                 }
                 ev->didHandle = true;
                 ev->result = 0;
@@ -18295,12 +18095,8 @@ static void OnTextReaderWndProc(ControlBase::WndProcEvent* ev) {
         ev->result = ev->w->WndProcDefault(ev->hwnd, ev->msg, ev->wparam, ev->lparam);
         ev->didHandle = true;
         if (win->IsDocLoaded() && !win->textReaderSinglePage) {
-            SyncPageFromTextCaret(win, true);
+            SyncPageFromTextCaret(win);
         }
         return;
-    } else if (msg == WM_KILLFOCUS || msg == WM_DESTROY) {
-        if (win->IsDocLoaded()) {
-            SyncPageFromTextCaret(win, true);
-        }
     }
 }
